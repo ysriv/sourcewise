@@ -2,32 +2,17 @@
 
 import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowUpRight, BookOpen, Check, ChevronDown, CircleHelp, FileText,
+  ArrowUpRight, BookOpen, Check, CircleHelp, FileText,
   FileUp, FlaskConical, LoaderCircle, MessageSquareText, RotateCcw, Send,
   Sparkles, X,
 } from "lucide-react";
 import { DEMO_DOCUMENT, DEMO_EXCERPTS, getDemoAnswer } from "@/lib/demo";
 import type { ChatMessage, ResearchAnswer, SourceExcerpt } from "@/lib/types";
+import { toExcerpts } from "@/lib/sources.mjs";
 
 const MAX_PDF_PAGES = 40;
 const CHUNK_SIZE = 1_500;
-
-function toExcerpts(text: string): SourceExcerpt[] {
-  const paragraphs = text.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
-  const chunks: SourceExcerpt[] = [];
-  paragraphs.forEach((paragraph, paragraphIndex) => {
-    for (let offset = 0; offset < paragraph.length; offset += CHUNK_SIZE) {
-      const textPart = paragraph.slice(offset, offset + CHUNK_SIZE).trim();
-      if (!textPart) continue;
-      chunks.push({
-        id: `text-${paragraphIndex + 1}-${offset}`,
-        location: `Section ${paragraphIndex + 1}`,
-        text: textPart,
-      });
-    }
-  });
-  return chunks;
-}
+const MAX_QUESTION_LENGTH = 1_000;
 
 function CitationButton({ citation, onOpen }: { citation: ChatMessage["citations"][number]; onOpen: (sourceId: string) => void }) {
   return (
@@ -46,11 +31,14 @@ export default function Home() {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
+  const [readingPdf, setReadingPdf] = useState(false);
   const [error, setError] = useState("");
+  const [sourceError, setSourceError] = useState("");
   const [sourceNotice, setSourceNotice] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const questionInput = useRef<HTMLTextAreaElement>(null);
   const latestMessageRef = useRef<HTMLDivElement>(null);
+  const sourceVersion = useRef(0);
   const wordCount = useMemo(() => documentText.trim().split(/\s+/).filter(Boolean).length, [documentText]);
   const sourceTooLarge = excerpts.length > 40 || excerpts.reduce((sum, item) => sum + item.text.length, 0) > 50_000;
 
@@ -69,19 +57,22 @@ export default function Home() {
   }
 
   function updateText(value: string) {
+    sourceVersion.current += 1;
     setDocumentText(value);
     setExcerpts(toExcerpts(value));
     setDocumentName("Pasted research notes");
     setIsDemo(false);
     setSourceNotice("");
+    setSourceError("");
     resetChat();
   }
 
   async function handleFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
-    setError("");
+    setSourceError("");
     setSourceNotice("");
+    setReadingPdf(true);
     try {
       if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
         throw new Error("Please choose a PDF file.");
@@ -89,7 +80,10 @@ export default function Home() {
       if (file.size > 15 * 1024 * 1024) throw new Error("This PDF is over 15 MB. Choose a smaller file.");
 
       const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-      pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.mjs", import.meta.url).toString();
+      // Next.js treats the PDF.js worker as an external ESM package when it is
+      // referenced through `new URL(...)`. Serve the matching worker from
+      // `public/` instead so the browser can load it directly.
+      pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.mjs";
       const bytes = new Uint8Array(await file.arrayBuffer());
       const pdf = await pdfjs.getDocument({ data: bytes }).promise;
       if (pdf.numPages > MAX_PDF_PAGES) throw new Error(`This PDF has ${pdf.numPages} pages. The limit is ${MAX_PDF_PAGES} pages.`);
@@ -119,24 +113,28 @@ export default function Home() {
         throw new Error("This PDF has too much text for one research session. Try a shorter document.");
       }
       setDocumentText(pageTexts.join("\n\n"));
+      sourceVersion.current += 1;
       setDocumentName(file.name.replace(/\.pdf$/i, ""));
       setExcerpts(pageExcerpts);
       setIsDemo(false);
       setSourceNotice(`${pageExcerpts.length} source sections extracted from ${pdf.numPages} pages.`);
       resetChat();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not read this PDF.");
+      setSourceError(caught instanceof Error ? caught.message : "Could not read this PDF.");
     } finally {
       event.target.value = "";
+      setReadingPdf(false);
     }
   }
 
   function switchToDemo() {
+    sourceVersion.current += 1;
     setDocumentText(DEMO_DOCUMENT);
     setDocumentName("Sleep, memory, and study habits");
     setExcerpts(DEMO_EXCERPTS);
     setIsDemo(true);
     setSourceNotice("Sample research is ready. Ask a question to explore it.");
+    setSourceError("");
     resetChat();
   }
 
@@ -151,6 +149,7 @@ export default function Home() {
     event?.preventDefault();
     const currentQuestion = question.trim();
     if (!currentQuestion || busy) return;
+    const submittedSourceVersion = sourceVersion.current;
     setError("");
     setBusy(true);
     try {
@@ -170,6 +169,7 @@ export default function Home() {
         if (!response.ok) throw new Error(payload.error || "Could not get an answer.");
         result = payload as ResearchAnswer;
       }
+      if (submittedSourceVersion !== sourceVersion.current) return;
       setMessages((previous) => [...previous, { ...result, id: crypto.randomUUID(), question: currentQuestion }]);
       setQuestion("");
     } catch (caught) {
@@ -194,11 +194,11 @@ export default function Home() {
           <span>sourcewise<span className="brand-period">.</span></span>
         </a>
         <div className="topbar-right">
-          <div className="trust-note"><span className="trust-dot" /> Your sources stay yours</div>
+          <div className="trust-note"><span className="trust-dot" /> {isDemo ? "Demo answers run locally" : liveAvailable ? "Sent to OpenAI when you ask" : "Your text stays in this browser"}</div>
           <button className="icon-button help-button" type="button" aria-label="About Sourcewise" title="Answers are grounded in the research you add.">
             <CircleHelp size={18} />
           </button>
-          <a className="github-link" href="https://github.com" target="_blank" rel="noreferrer">GitHub <ArrowUpRight size={14} /></a>
+          <a className="github-link" href="https://github.com/ysriv/sourcewise" target="_blank" rel="noreferrer">GitHub <ArrowUpRight size={14} /></a>
         </div>
       </header>
 
@@ -215,12 +215,12 @@ export default function Home() {
               <span className="step-number">01</span>
               <div><h2>Your research</h2><p>Give your questions some context.</p></div>
             </div>
-            <button className="more-button" type="button" onClick={switchToDemo} title="Load sample research"><RotateCcw size={15} /></button>
+            <button className="load-sample-button" type="button" onClick={switchToDemo} disabled={readingPdf} aria-label="Load sample research"><RotateCcw size={14} /> Load sample</button>
           </div>
 
           <div className="source-tabs">
             <span className="source-tab active"><FileText size={14} /> Source</span>
-            <button className="source-tab upload-tab" type="button" onClick={() => fileInput.current?.click()}><FileUp size={14} /> Upload PDF</button>
+            <button className="source-tab upload-tab" type="button" disabled={readingPdf} onClick={() => fileInput.current?.click()}><FileUp size={14} /> Upload PDF</button>
             <input ref={fileInput} type="file" accept="application/pdf,.pdf" onChange={handleFile} hidden />
           </div>
 
@@ -236,23 +236,30 @@ export default function Home() {
               className="research-textarea"
               value={documentText}
               onChange={(event) => updateText(event.target.value)}
+              disabled={readingPdf}
               placeholder="Paste an article, paper, or class notes here…"
               spellCheck={false}
             />
-            <div className="document-footer"><span>{wordCount.toLocaleString()} words</span><span>{isDemo ? "Demo source" : "Your source"}</span></div>
+            <div className="document-footer">
+              <span>{wordCount.toLocaleString()} words</span>
+              {!isDemo && documentText && <button className="clear-source" type="button" onClick={() => updateText("")}>Clear source</button>}
+              {isDemo && <span>Demo source</span>}
+            </div>
           </div>
 
           <div className="source-actions">
-            <button className="text-action" type="button" onClick={() => fileInput.current?.click()}><FileUp size={15} /> Choose a PDF</button>
+            <button className="text-action" type="button" disabled={readingPdf} onClick={() => fileInput.current?.click()}>{readingPdf ? <LoaderCircle className="spin" size={15} /> : <FileUp size={15} />} {readingPdf ? "Reading PDF…" : "Choose a PDF"}</button>
             <span className="source-limit">Text-based PDFs · up to 40 pages</span>
           </div>
-          {sourceNotice && <div className="notice success-notice"><Check size={14} /> {sourceNotice}</div>}
-          {error && <div className="notice error-notice"><X size={14} /> {error}</div>}
+          {sourceNotice && <div className="notice success-notice" role="status" aria-live="polite"><Check size={14} /> {sourceNotice}</div>}
+          {sourceError && <div className="notice error-notice" role="alert"><X size={14} /> {sourceError}</div>}
           {sourceTooLarge && <div className="notice error-notice"><X size={14} /> This source is too large for one session. Use up to 50,000 characters across 40 sections.</div>}
-          {!liveAvailable && <div className="api-note"><Sparkles size={15} /><span>Demo mode is ready. Add an API key to ask about your own sources.</span></div>}
+          {!documentText.trim() && <div className="notice empty-source-notice">Paste research above or choose a PDF to start. You can always reload the sample.</div>}
+          {!liveAvailable && <div className="api-note"><Sparkles size={15} /><span>{isDemo ? "Demo mode is ready. Try a sample question below — no API key needed." : "To ask AI about your own source, add OPENAI_API_KEY to .env.local. Your text stays in this browser until you ask."}</span></div>}
+          {liveAvailable && !isDemo && <div className="api-note"><Sparkles size={15} /><span>When you ask, your question and selected source excerpts are sent to OpenAI for an answer. Your API key stays on the server.</span></div>}
 
           <div className="source-outline">
-            <div className="outline-heading"><span>IN THIS SOURCE</span><ChevronDown size={13} /></div>
+            <div className="outline-heading"><span>IN THIS SOURCE</span></div>
             <div className="outline-list">
               {excerpts.slice(0, 4).map((excerpt, index) => (
                 <button className="outline-row" key={excerpt.id} onClick={() => openCitation(excerpt.id)} type="button">
@@ -276,7 +283,7 @@ export default function Home() {
             <div className="mode-pill"><span className="mode-dot" /> {isDemo ? "DEMO MODE" : liveAvailable ? "AI MODE" : "ADD API KEY"}</div>
           </div>
 
-          <div className="chat-content">
+          <div className="chat-content" aria-busy={busy}>
             {messages.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-orbit orbit-one" /><div className="empty-orbit orbit-two" />
@@ -284,7 +291,7 @@ export default function Home() {
                 <span className="empty-kicker">A GOOD PLACE TO START</span>
                 <h3>What are you curious about?</h3>
                 <p>Ask a question. Sourcewise will look through your material and show its work.</p>
-                <div className="suggestion-list">
+                <div className="suggestion-list" aria-label="Suggested questions">
                   {(isDemo ? ["What did the study find about sleep?", "What study habits did researchers recommend?", "What are the limitations?"] : ["What are the key findings?", "What evidence supports the main argument?", "What limitations should I keep in mind?"]).map((suggestion) => (
                     <button className="suggestion" type="button" key={suggestion} onClick={() => setQuestion(suggestion)}>
                       <span>{suggestion}</span><ArrowUpRight size={14} />
@@ -299,7 +306,7 @@ export default function Home() {
                     <div className="user-question"><span className="avatar user-avatar">Y</span><p>{message.question}</p></div>
                     <div className="assistant-answer">
                       <span className="avatar assistant-avatar"><Sparkles size={14} /></span>
-                      <div className="answer-body">
+                      <div className="answer-body" aria-live="polite">
                         <p>{message.answer}</p>
                         {message.citations.length > 0 && <div className="citations"><span className="cited-label">SOURCE</span>{message.citations.map((citation, index) => <CitationButton key={`${message.id}-${index}`} citation={citation} onOpen={openCitation} />)}</div>}
                         {message.citations.map((citation, index) => <blockquote className="quote-card" key={`${message.id}-quote-${index}`}><span>“</span>{citation.quote}</blockquote>)}
@@ -315,7 +322,7 @@ export default function Home() {
           </div>
 
           <div className="composer-area">
-            {error && <div className="composer-error"><X size={14} /> {error}</div>}
+            {error && <div className="composer-error" role="alert"><X size={14} /> {error}</div>}
             <form className="composer" onSubmit={submitQuestion}>
               <label className="sr-only" htmlFor="question-input">Ask a question about the source</label>
               <textarea
@@ -326,12 +333,13 @@ export default function Home() {
                 onChange={(event) => setQuestion(event.target.value)}
                 onKeyDown={onQuestionKeyDown}
                 placeholder="Ask a question about your source…"
+                maxLength={MAX_QUESTION_LENGTH}
               />
-              <button className="send-button" type="submit" disabled={!question.trim() || busy} aria-label="Send question">
+              <button className="send-button" type="submit" disabled={!question.trim() || busy || excerpts.length === 0} aria-label="Send question">
                 {busy ? <LoaderCircle className="spin" size={17} /> : <Send size={16} />}
               </button>
             </form>
-            <div className="composer-hint"><span><kbd>↵</kbd> to ask</span><span>Answers grounded in your sources</span></div>
+            <div className="composer-hint"><span><kbd>↵</kbd> to ask</span><span>{question.length}/{MAX_QUESTION_LENGTH} · Answers grounded in your sources</span></div>
           </div>
         </section>
       </section>
